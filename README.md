@@ -47,7 +47,7 @@ Add the `--dry-run` command line argument to preview the RAW files it will add, 
 hatch run extract-raw-pixls --dry-run
 ```
 
-Please note: irrespective of whether you run the program with or without the `--dry-run` argument, it ensures that the entire contents of the raw.pixls.us Git repository (including all RAW files) are saved locally.
+Please note: irrespective of whether you run the program with or without the `--dry-run` argument, it saves the entire contents of the raw.pixls.us Git repository (including all RAW files) into the `.git` folder.
 
 ## License
 
