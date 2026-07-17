@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "extract-raw-pixls"
+dynamic = ["version"]
+description = 'Download the entire contents of the Git repository of RAW files found at Pixls.us to a Windows file system'
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+keywords = []
+authors = [
+  { name = "Damon Lynch", email = "damonlynch@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = ["python-dotenv", "rich"]
+
+[project.scripts]
+extract-raw-pixls = "extract_raw_pixls.extract:main"
+
+[project.urls]
+Documentation = "https://github.com/damonlynch/extract-raw-pixls#readme"
+Issues = "https://github.com/damonlynch/extract-raw-pixls/issues"
+Source = "https://github.com/damonlynch/extract-raw-pixls"
+
+[tool.hatch.version]
+path = "src/extract_raw_pixls/__about__.py"
+
+[tool.hatch.envs.types]
+extra-dependencies = [
+  "mypy>=1.0.0",
+]
+[tool.hatch.envs.types.scripts]
+check = "mypy --install-types --non-interactive {args:src/extract_raw_pixls tests}"
+
+[tool.coverage.run]
+source_pkgs = ["extract_raw_pixls", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/extract_raw_pixls/__about__.py",
+]
+
+[tool.coverage.paths]
+extract_raw_pixls = ["src/extract_raw_pixls", "*/extract-raw-pixls/src/extract_raw_pixls"]
+tests = ["tests", "*/extract-raw-pixls/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+]
+extend-select = [
+    "E501",
+    "UP", # pyupgrade
+]
