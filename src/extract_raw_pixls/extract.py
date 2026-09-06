@@ -89,21 +89,21 @@ def validate_directories() -> None:
     logger.info("RAW files directory: %s", OUTPUT_DIRECTORY)
 
 
-def run(*args: str, cwd: Path | str | None = None) -> str:
+def run(*args: str, cwd: Path | str | None = None, text:bool=True) -> str:
     """
     Execute a command and return its stdout output.
 
     :param args: Command and arguments to execute.
     :param cwd:  Working directory for the command.
+    :param text: subprocess.check_output text mode
     :return: The command's stdout output.
     :raises subprocess.CalledProcessError: If the command returns non-zero exit code.
     """
     return subprocess.check_output(
         args,
         cwd=cwd,
-        text=True,
+        text=text,
     )
-
 
 def git(*args: str) -> str:
     """
@@ -199,32 +199,54 @@ def sanitize_component(name: str) -> str:
     if not result:
         result = "_"
 
-    if result.split(".")[0].upper() in RESERVED_NAMES:
+    # Windows device names are reserved even when an extension is present.
+    if result.split(".", 1)[0].upper() in RESERVED_NAMES:
         result = "_" + result
 
     return result
 
+def sanitize_path(path: str) -> Path:
+    """Sanitize a Git path without adding a collision suffix."""
+    return Path(
+        *(sanitize_component(part)
+          for part in PurePosixPath(path).parts)
+    )
 
-def sanitize_path(path: str, oid: str) -> Path:
+
+def make_destination_map(entries):
     """
-    Sanitize a full path for safe filesystem usage.
+    Map every Git path to a unique Windows-safe destination.
 
-    Processes each path component through sanitize_component and appends
-    a hash digest to the filename if sanitization altered the original path,
-    preventing collisions.
-
-    :param path: The original POSIX path to sanitize.
-    :param oid: Object identifier used for collision resolution hashing.
-    :return: A Path object with sanitized components.
+    A hash is added only when two or more Git paths would produce
+    the same Windows filename on Windows.
     """
-    parts = [sanitize_component(p) for p in PurePosixPath(path).parts]
+    candidates = {}
 
-    result = Path(*parts)
+    for entry in entries:
+        destination = sanitize_path(entry["path"])
+        key = str(destination).casefold()
 
-    # Prevent collisions after sanitizing
-    if str(result) != path:
-        digest = hashlib.sha1(oid.encode()).hexdigest()[:8]
-        result = result.with_name(f"{result.stem}_{digest}{result.suffix}")
+        candidates.setdefault(key, []).append(
+            (entry, destination)
+        )
+
+    result = {}
+
+    for matching_entries in candidates.values():
+        if len(matching_entries) == 1:
+            entry, destination = matching_entries[0]
+            result[entry["path"]] = destination
+            continue
+
+        # Genuine collision after Windows filename sanitisation.
+        for entry, destination in matching_entries:
+            digest = hashlib.sha256(
+                entry["sha"].encode("ascii")
+            ).hexdigest()[:8]
+
+            result[entry["path"]] = destination.with_name(
+                f"{destination.stem}_{digest}{destination.suffix}"
+            )
 
     return result
 
@@ -277,30 +299,35 @@ def get_tree() -> list[dict[str, str]]:
 
     :return: List of dictionaries with 'sha' and 'path' keys for each blob.
     """
-    output = git(
-        "ls-tree",
-        "-r",
-        "-z",
-        "HEAD",
+
+    output = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(GIT_DIRECTORY),
+            "-c",
+            "core.quotepath=false",
+            "ls-tree",
+            "-r",
+            "-z",
+            "HEAD",
+        ]
     )
 
     entries = []
 
-    for item in output.split("\0"):
+    for item in output.split(b"\0"):
         if not item:
             continue
 
-        mode, typ, sha, path = item.split(maxsplit=3)
+        metadata, path = item.split(b"\t", 1)
 
-        # Skip trees (directories), symlinks, and gitlink (submodules)
-        if typ != "blob":
-            logger.debug("Skipping non-blob entry: %s (%s)", path, typ)
-            continue
+        mode, typ, sha = metadata.split(b" ", 2)
 
         entries.append(
             {
-                "sha": sha,
-                "path": path,
+                "sha": sha.decode("ascii"),
+                "path": path.decode("utf-8"),
             }
         )
 
@@ -372,118 +399,126 @@ def get_file_source(entry: dict[str, str]) -> Path | bytes:
 
 def extract(dry_run: bool = False) -> None:
     """
-    Extract files from the Git repository to the output directory.
-    
-    Compares current repository state with the existing manifest to determine
-    which files need to be added, updated, or removed. Updates the manifest
-    atomically when complete.
-    
-    :param dry_run: If True, only report what changes would be made to the RAW files 
-       without actually modifying the filesystem.
-    """
-    if dry_run:
-        logger.info("=== DRY RUN MODE - No changes will be made ===")
-    else:
-        OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    Extract all files from the Git repository into the output directory.
 
+    Compares the current repository tree against the saved manifest and
+    copies or writes any changed files, resolving Git LFS pointers to the
+    locally fetched LFS objects. Removes physical files that no longer
+    exist in the tree or whose destination changed, then saves the new
+    manifest.
+
+    With dry_run enabled, prints the files that would be copied or removed
+    and summary statistics without modifying the filesystem or manifest.
+
+    :param dry_run: When True, preview changes without modifying the filesystem.
+    """
     old_manifest = load_manifest()
     new_manifest = {}
 
     tree = get_tree()
+    destination_map = make_destination_map(tree)
 
-    files_to_add = 0
-    files_to_update = 0
-    files_to_remove = 0
+    changed = 0
+    unchanged = 0
+    collisions = 0
 
-    for entry in track(tree, description="Extracting", console=console):
-        source = get_file_source(entry)
+    # Build the new manifest first.
+    for entry in tree:
+        source_path = entry["path"]
 
-        destination = OUTPUT_DIRECTORY / sanitize_path(
-            entry["path"],
-            entry["sha"],
+        destination = (
+            OUTPUT_DIRECTORY
+            / destination_map[source_path]
         )
 
-        key = entry["path"]
-
-        new_manifest[key] = {
+        new_manifest[source_path] = {
             "sha": entry["sha"],
             "destination": str(destination),
         }
 
-        if old_manifest.get(key) == new_manifest[key]:
+    # Find physical files that need to be removed.
+    files_to_remove = set()
+
+    # 1. Git paths that no longer exist.
+    for source_path in set(old_manifest) - set(new_manifest):
+        files_to_remove.add(
+            old_manifest[source_path]["destination"]
+        )
+
+    # 2. Existing Git paths whose local destination changed.
+    for source_path in set(old_manifest) & set(new_manifest):
+        old_destination = old_manifest[source_path]["destination"]
+        new_destination = new_manifest[source_path]["destination"]
+
+        if old_destination != new_destination:
+            files_to_remove.add(old_destination)
+
+    # Extract/update files.
+    for entry in track(tree, description="Extracting"):
+        source_path = entry["path"]
+        destination = Path(
+            new_manifest[source_path]["destination"]
+        )
+
+        if old_manifest.get(source_path) == new_manifest[source_path]:
+            unchanged += 1
             continue
 
+        changed += 1
+
+        if (
+            destination_map[source_path]
+            != sanitize_path(source_path)
+        ):
+            collisions += 1
+
+        if dry_run:
+            print(
+                f"Would extract:\n"
+                f"  {source_path}\n"
+                f"  -> {destination}"
+            )
+            continue
+
+        source = get_file_source(entry)
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
         if isinstance(source, Path):
-            source_size = (
-                format_bytes(source.stat().st_size)
-                if source.exists()
-                else format_bytes(0)
-            )
+            shutil.copy2(source, destination)
         else:
-            source_size = format_bytes(len(source))
+            destination.write_bytes(source)
 
-        if dry_run:
-            if key in old_manifest:
-                logger.info(
-                    "  UPDATE: %s -> %s (%s)", entry["path"], destination, source_size
-                )
-                files_to_update += 1
-            else:
-                logger.info(
-                    "  ADD:    %s -> %s (%s)", entry["path"], destination, source_size
-                )
-                files_to_add += 1
-        else:
-            destination.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+    # Remove obsolete physical files.
+    if dry_run:
+        for filename in sorted(files_to_remove):
+            print(f"Would remove: {filename}")
 
-            if isinstance(source, Path):
-                shutil.copy2(
-                    source,
-                    destination,
-                )
-            else:
-                destination.write_bytes(source)
+        print()
+        print(f"Files:        {len(tree):,}")
+        print(f"Unchanged:    {unchanged:,}")
+        print(f"Would copy:   {changed:,}")
+        print(f"Would remove: {len(files_to_remove):,}")
+        print(f"Collisions:   {collisions:,}")
+        return
 
-    removed = set(old_manifest) - set(new_manifest)
+    for filename in files_to_remove:
+        path = Path(filename)
 
-    for item in removed:
-        old_file = Path(old_manifest[item]["destination"])
-        if dry_run:
-            if old_file.exists():
-                logger.info(f"  REMOVE: {old_file}")
-                files_to_remove += 1
-        else:
-            try:
-                old_file.unlink(missing_ok=True)
-            except OSError as e:
-                logger.warning("Failed to remove %s: %s", old_file, e)
+        if path.exists():
+            path.unlink()
 
-    if not dry_run:
-        save_manifest(new_manifest)
+    save_manifest(new_manifest)
 
-        # Clean up empty directories left behind
-        for dirpath in sorted(OUTPUT_DIRECTORY.rglob("*"), reverse=True):
-            if dirpath.is_dir():
-                with contextlib.suppress(OSError):
-                    dirpath.rmdir()  # Only succeeds if empty
-
-    else:
-        logger.info("=== DRY RUN SUMMARY ===")
-        logger.info(
-            f"Files to add:    {locale.format_string('%d', files_to_add, grouping=True)}"
-        )
-        logger.info(
-            f"Files to update: {locale.format_string('%d', files_to_update, grouping=True)}"
-        )
-        logger.info(
-            f"Files to remove: {locale.format_string('%d', files_to_remove, grouping=True)}"
-        )
-        logger.info(
-            f"Total changes:   {locale.format_string('%d', files_to_add + files_to_update + files_to_remove, grouping=True)}"
-        )
+    print()
+    print(f"Files:        {len(tree):,}")
+    print(f"Unchanged:    {unchanged:,}")
+    print(f"Copied:       {changed:,}")
+    print(f"Removed:      {len(files_to_remove):,}")
+    print(f"Collisions:   {collisions:,}")
 
 
 def main() -> None:
